@@ -1,0 +1,26 @@
+# ReSkate Installer (`reskate-installer`)
+
+Linux-only Rust tool that installs ReSkate (Dingo-Shenanigans/ReSkate) for skate. (Steam app 3354750) under Proton. Code and conventions come from ../gmod/gmtoolkit.
+
+## Commands
+- `cargo run` (no args): GUI (egui, `src/gui.rs`). Its buttons re-run this binary with CLI args in the background and stream stdout/stderr into the log
+- `cargo test`: unit tests. `cargo test -- --ignored` also round-trips this machine's real localconfig.vdf (read-only)
+- `cargo run -- install [<folder>]` / `off [--delete]`: these edit the real Steam config, and Steam must be closed unless `--close-steam` is given
+
+## How it works
+- Install: latest release's `ReSkate-<ver>.zip` (GitHub sha256 digest checked). Its entries use `\` separators, which `extract` normalizes. It goes into its own folder (default `~/Games/ReSkate`, or inside `~/.var/app/com.valvesoftware.Steam` for Flatpak Steam), and skate.'s `LaunchOptions` is set to ReSkate's README swap: `bash -c 'exec "${@/*EAAntiCheat.GameServiceLauncher.exe/<dir>/ReSkateLauncher.exe}"' -- %command%`
+- Launch options live in `userdata/<accountid>/config/localconfig.vdf` (Software/Valve/Steam/apps/3354750) of the account picked from loginusers.vdf (MostRecent, else latest Timestamp). Written with gmtoolkit's own `write_vdf`
+- `<data>/reskate-installer/install.txt`: folder, the launch options from before the first install (restored on `off` if ours is still set), then the unpacked files (`off` deletes those; `--delete` deletes the folder, including the game copy, mods and settings)
+- Placeholder: when skate. isn't installed in Steam, `install` writes `appmanifest_3354750.acf` (StateFlags 4, AutoUpdateBehavior 1) claiming Steam's current build and game depot (3354751) manifest, read from `appcache/appinfo.vdf` (binary, v28/v29, `appinfo_build`). Steam then downloads only the anti-cheat depot (3893181, ~350 MB), which has the exe the launch option swaps. Claiming an older build makes Steam download the whole game (tested 2026-10-14; with the current build, the game and mods load and play). `placeholder()` = fully installed without Skate.exe; Repair rewrites it to the current build (`placeholder_outdated`), `off` removes it
+- `check_dir`: the launcher refuses any path under `steamapps/common`. Paths with shell or quote characters are refused because they would break the launch option. The folder must be empty or already have `ReSkateLauncher.exe`/`Skate.exe`
+- `--close-steam` (the GUI adds it after its "Steam needs to close" dialog, `steam_task`): `close_steam` runs `steam -shutdown` (`flatpak run com.valvesoftware.Steam -shutdown` for Flatpak), waits up to 60s for `pgrep -x steam` to clear, and never kills it. Afterwards `main` starts Steam again, even if the task failed. Steam and `xdg-open` are started through `spawn_detached` (null stdio, own process group), because the GUI reads the child's pipes until every writer has closed them
+- Versions: `install --version <tag>` pins a release, from `OLDEST` (v1.0.1, the first whose launcher installs the game into an empty folder and has `--no-update`) on. A pinned version's launch option ends in `--no-update`, because the launcher otherwise updates itself to the latest on start. Without `--version` it follows the latest and updates itself. The pinned tag is line 3 of install.txt ("" = latest), and `launch_ok`/`off` compare against the matching launch option. GUI: version dropdown (`releases()`, fetched in the background; "" = latest), Switch when the pick differs from the pin, Repair reinstalls the pinned version
+- Discord Rich Presence (`install --rpc`, GUI checkbox; ReSkate has it since v2.0.3): unpacks rpc-bridge's latest `bridge.zip` into `<dir>/rpc-bridge` and prefixes the launch option with `sh "<dir>/rpc-bridge/bridge.sh" `, which has Proton start `bridge.exe --steam` next to the game (`PROTON_REMOTE_DEBUG_CMD`). Proton `shlex`-splits that command, so it's refused for paths with spaces. Recorded as `rpc-bridge/bridge.sh` among install.txt's files (`Record::rpc`); installing without `--rpc` deletes the folder. The bridge registers an `rpc-bridge` service in skate.'s prefix, which stays after uninstall
+- The own-folder setup was only documented for Linux from v2.0.8 (unreleased as of 2026-10-14), but the empty-folder install exists since v1.0.1
+
+## Releases
+- Versions are `YY.MM.PATCH`: year, month, then the release number within that month starting at 1 (first release in October 2026 = 26.10.1, the next 26.10.2, the first in November 26.11.1). No zero padding (`27.1.1`, not `27.01.1`): Cargo's semver rejects leading zeros
+- Bump `version` in Cargo.toml and tag it `v<version>` (the release workflow builds on `v*` tags)
+
+## Git
+- No Claude attribution anywhere in git: no `Co-Authored-By: Claude` trailers, no "Generated with Claude Code" lines in commits, PRs or release notes. Commits are authored by the repo owner only
