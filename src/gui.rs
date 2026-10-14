@@ -316,6 +316,9 @@ struct App {
     /// Installed with Discord Rich Presence (rpc-bridge), and the checkbox for it.
     bridge: bool,
     rpc: bool,
+    /// Install/Repair fixes file names with `\` in them (`--fix-names`); `broken_names`: ReSkate's folder has some.
+    fix_names: bool,
+    broken_names: bool,
 }
 
 impl App {
@@ -324,7 +327,7 @@ impl App {
             log: Default::default(), busy: Default::default(), ran: false, skate: Err(String::new()), placeholder: false, outdated: false, installed: None,
             launch_ok: false, dir_input: crate::default_dir().display().to_string(), picked_folder: Default::default(),
             show_log: false, confirm: false, delete_folder: false, close_steam: None,
-            pinned: None, releases: Default::default(), selected: String::new(), bridge: false, rpc: false,
+            pinned: None, releases: Default::default(), selected: String::new(), bridge: false, rpc: false, fix_names: true, broken_names: false,
         };
         app.refresh_status();
         app
@@ -340,6 +343,7 @@ impl App {
         self.selected = self.pinned.clone().unwrap_or_default();
         self.bridge = crate::rpc();
         self.rpc = self.bridge;
+        self.broken_names = self.installed.as_deref().is_some_and(crate::broken_names);
         if let Some(d) = &self.installed { self.dir_input = d.display().to_string(); }
     }
 
@@ -384,6 +388,7 @@ impl App {
         if self.installed.is_none() { args.push(self.dir_input.trim().to_owned()); }
         if !version.is_empty() { args.extend(["--version".to_owned(), version.to_owned()]); }
         if self.rpc { args.push("--rpc".to_owned()); }
+        if self.fix_names { args.push("--fix-names".to_owned()); }
         self.steam_task(ctx, &args.iter().map(String::as_str).collect::<Vec<_>>());
     }
 
@@ -399,6 +404,8 @@ impl App {
         let dir = PathBuf::from(self.dir_input.trim());
         // Shown as a sentence, so capitalized (CLI errors read "Error: use a full path").
         let dir_ok = crate::check_dir(&dir).map_err(|e| { let e = e.to_string(); e[..1].to_uppercase() + &e[1..] });
+        // Only flagged while the fix is on, so unchecking it stops the nagging.
+        let broken = self.fix_names && self.broken_names;
         ui.horizontal(|ui| {
             ui.set_min_height(46.0);
             ui.vertical(|ui| {
@@ -408,19 +415,21 @@ impl App {
                     if self.installed.is_some() {
                         // Painted dot: the default font has no bullet glyph.
                         let (rect, resp) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                        let ok = self.launch_ok && !self.outdated;
+                        let ok = self.launch_ok && !self.outdated && !broken;
                         ui.painter().circle_filled(rect.center(), 4.0, if ok { p.good } else { p.danger });
-                        resp.on_hover_text(if ok { "Installed" } else if self.outdated { "Placeholder outdated" } else { "Launch option missing" });
+                        resp.on_hover_text(if ok { "Installed" } else if self.outdated { "Placeholder outdated" }
+                            else if broken { "Broken file names" } else { "Launch option missing" });
                     }
                 });
                 let sub = match &self.installed {
                     Some(_) if !self.launch_ok => "skate.'s launch option no longer starts ReSkate: press Repair".into(),
                     Some(_) if self.outdated => "skate. was updated on Steam: press Repair, or Steam downloads all 15 GB of it".into(),
+                    Some(_) if broken => "Some files in ReSkate's folder have broken names, which break mods: press Repair".into(),
                     Some(d) => format!("Installed in {} · {}", d.display(),
                         self.pinned.as_ref().map_or("updates itself".to_owned(), |v| format!("pinned to {v}"))),
                     None => "Offline play, multiplayer and mods for skate.".into(),
                 };
-                let bad = self.installed.is_some() && (!self.launch_ok || self.outdated);
+                let bad = self.installed.is_some() && (!self.launch_ok || self.outdated || broken);
                 ui.label(RichText::new(sub).small().color(if bad { p.danger } else { p.muted }));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -448,7 +457,7 @@ impl App {
                         if self.selected != current || self.rpc != self.bridge {
                             let label = if self.selected != current { "Switch" } else { "Apply" };
                             if ui.add(primary(label).min_size(size)).clicked() { self.install(ui.ctx(), &self.selected.clone()); }
-                        } else if !self.launch_ok || self.outdated {
+                        } else if !self.launch_ok || self.outdated || broken {
                             if ui.add(primary("Repair").min_size(size)).on_hover_text("Download ReSkate again and set the launch option").clicked() {
                                 self.install(ui.ctx(), &current);
                             }
@@ -475,6 +484,9 @@ impl App {
         ui.add_enabled(!spaces, egui::Checkbox::new(&mut self.rpc, "Discord Rich Presence"))
             .on_hover_text("Installs rpc-bridge, so ReSkate can show what you're playing in Discord or Vesktop")
             .on_disabled_hover_text("Needs a folder without spaces in its path");
+        ui.checkbox(&mut self.fix_names, "Fix broken file names")
+            .on_hover_text("On Install and Repair, fixes files whose names contain \\ (left by some Linux unzip tools). \
+                They stop ReSkate from combining mods, so only one custom map or cosmetic mod works.");
         if self.installed.is_some() { return; }
         ui.separator();
         ui.label(RichText::new("Folder").small().color(p.muted));

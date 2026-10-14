@@ -26,15 +26,15 @@ fn main() -> Result<()> {
     // --close-steam: quit Steam for the edit (the GUI asks first) and start it again afterwards.
     let closed = flag("--close-steam") && steam_running() && { close_steam()?; true };
     let result = match cmd {
-        // install [<folder>] [--version <tag>] [--rpc] [--close-steam]
+        // install [<folder>] [--version <tag>] [--rpc] [--fix-names] [--close-steam]
         Some("install") => {
             let version = args.iter().position(|a| a == "--version").and_then(|i| args.get(i + 1)).map(String::as_str);
             let dir = args.iter().skip(1).find(|a| !a.starts_with("--") && Some(a.as_str()) != version).map(PathBuf::from);
-            install(dir, version, flag("--rpc"))
+            install(dir, version, flag("--rpc"), flag("--fix-names"))
         }
         // off [--delete] [--close-steam]
         Some("off") => uninstall(flag("--delete")),
-        _ => Err(anyhow::anyhow!("unknown command, use: install [<folder>] [--version <tag>] [--rpc] | off [--delete], either with --close-steam")),
+        _ => Err(anyhow::anyhow!("unknown command, use: install [<folder>] [--version <tag>] [--rpc] [--fix-names] | off [--delete], either with --close-steam")),
     };
     if closed {
         println!("starting Steam again");
@@ -45,8 +45,8 @@ fn main() -> Result<()> {
 
 /// Downloads a ReSkate release (the latest unless `version`) into `dir` and points skate.'s Steam launch option at
 /// its launcher. The launcher keeps itself up to date from then on, unless a version was picked: that one is pinned.
-/// `rpc` adds rpc-bridge to the launch option, for Discord Rich Presence.
-fn install(dir: Option<PathBuf>, version: Option<&str>, rpc: bool) -> Result<()> {
+/// `rpc` adds rpc-bridge to the launch option, for Discord Rich Presence. `fix_names` runs `fix_names` on the folder.
+fn install(dir: Option<PathBuf>, version: Option<&str>, rpc: bool, fix_names: bool) -> Result<()> {
     if let Some(v) = version && !supported(v) { bail!("{v} is too old: ReSkate installs into a folder of its own from {OLDEST} on"); }
     if steam_running() { bail!("Close Steam first, or pass --close-steam (Steam rewrites its settings when it closes)"); }
     // The Steam library to write skate.'s placeholder into: a new one, or the one there (to its current build).
@@ -73,6 +73,14 @@ fn install(dir: Option<PathBuf>, version: Option<&str>, rpc: bool) -> Result<()>
     println!("downloading {asset}");
     let mut files = extract(&github_asset(&release, asset)?, &dir)?;
     if !files.iter().any(|f| f == LAUNCHER) { bail!("the release zip has no {LAUNCHER}"); }
+    // A workaround, so it doesn't fail the install.
+    if fix_names {
+        match self::fix_names(&dir, true) {
+            Ok(0) => {}
+            Ok(n) => println!("fixed {n} file name(s) with `\\` in them"),
+            Err(e) => eprintln!("couldn't fix the file names with `\\` in them: {e}"),
+        }
+    }
     if rpc {
         let bridge = github_json(&format!("{BRIDGE_REPO}/releases/latest"))?;
         println!("downloading rpc-bridge {}", bridge["tag_name"].as_str().unwrap_or("?"));
@@ -142,6 +150,39 @@ fn extract(zip: &[u8], dir: &Path) -> Result<Vec<String>> {
     }
     Ok(files)
 }
+
+/// Files a Linux unzip tool left with `\` in their names (ReSkate's release zips use `\` separators, and some mods'
+/// may): under Proton they throw off the paths in ReSkate's folder listings, so it can't load the game's Oodle DLL and
+/// its mod merge keeps one mod's copy of shared files (ReSkate issues 109 and 124). Moves each where it belongs, or
+/// deletes it when that file is already there; returns how many it fixed (without `apply`: would fix, changing nothing).
+// ponytail: workaround; delete once the oldest supported release has ReSkate's fix (commit d0985ff, from v2.0.8)
+fn fix_names(dir: &Path, apply: bool) -> Result<usize> {
+    let mut fixed = 0;
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let (path, is_dir) = (entry.path(), entry.file_type()?.is_dir());
+        if is_dir { fixed += fix_names(&path, apply)?; }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.contains('\\') { continue; }
+        // A folder entry (`licenses\`): fixed when empty.
+        if is_dir {
+            if fs::read_dir(&path)?.next().is_none() { if apply { fs::remove_dir(&path)?; } fixed += 1; }
+            continue;
+        }
+        let name = name.replace('\\', "/");
+        let rel = Path::new(&name);
+        if !rel.components().all(|c| matches!(c, std::path::Component::Normal(_))) { continue; }
+        if apply {
+            let dst = dir.join(rel);
+            if dst.exists() { fs::remove_file(&path)?; } else { fs::create_dir_all(dst.parent().unwrap())?; fs::rename(&path, &dst)?; }
+        }
+        fixed += 1;
+    }
+    Ok(fixed)
+}
+
+/// Whether ReSkate's folder has file names `fix_names` would fix.
+pub fn broken_names(dir: &Path) -> bool { fix_names(dir, false).is_ok_and(|n| n > 0) }
 
 /// The Steam launch option that runs ReSkate's launcher in place of EA's anti-cheat (ReSkate's README,
 /// "Linux (Proton)"). Keeps skate.'s app ID and Proton prefix, unlike a non-Steam game shortcut. A pinned version
@@ -622,6 +663,22 @@ fn extract_windows_zip() {
     let files = extract(buf.get_ref(), &tmp.join("dir")).unwrap();
     assert_eq!(files, ["licenses/a-LICENSE.txt", LAUNCHER]);
     assert!(tmp.join("dir/licenses/a-LICENSE.txt").is_file() && !tmp.join("evil.txt").exists());
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn fixes_backslash_names() {
+    let tmp = std::env::temp_dir().join(format!("reskate-installer-names-{}", std::process::id()));
+    fs::create_dir_all(tmp.join("licenses")).unwrap();
+    fs::create_dir_all(tmp.join("Mods/m/Win32\\levels")).unwrap();
+    for f in ["licenses/a.txt", "licenses\\a.txt", "Mods/m/Win32\\globals.toc", "..\\evil.txt"] { fs::write(tmp.join(f), f).unwrap(); }
+    assert_eq!(fix_names(&tmp, false).unwrap(), 3);
+    assert!(tmp.join("licenses\\a.txt").exists() && broken_names(&tmp));
+    assert_eq!(fix_names(&tmp, true).unwrap(), 3);
+    assert!(!broken_names(&tmp));
+    assert_eq!(fs::read_to_string(tmp.join("licenses/a.txt")).unwrap(), "licenses/a.txt");
+    assert_eq!(fs::read_to_string(tmp.join("Mods/m/Win32/globals.toc")).unwrap(), "Mods/m/Win32\\globals.toc");
+    assert!(!tmp.join("licenses\\a.txt").exists() && !tmp.join("Mods/m/Win32\\levels").exists() && tmp.join("..\\evil.txt").exists());
     fs::remove_dir_all(&tmp).unwrap();
 }
 

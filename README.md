@@ -15,11 +15,13 @@ If EA's anti-cheat error appears when launching, open the installer and click Re
 From the command line:
 
 ```
-reskate-installer install [<folder>] [--version <tag>] [--rpc]
+reskate-installer install [<folder>] [--version <tag>] [--rpc] [--fix-names]
 reskate-installer off [--delete]
 ```
 
 Steam must be closed unless `--close-steam` is passed. `--delete` also removes the game files.
+
+Fix broken file names (the checkbox, on by default, or `--fix-names`) repairs files with `\` in their names in the ReSkate folder, which some Linux unzip tools leave behind when ReSkate is unpacked by hand. Under Proton they keep ReSkate from combining mods, so only one custom map or cosmetic mod works.
 
 Discord Rich Presence (the checkbox, or `--rpc`) installs [rpc-bridge](https://github.com/EnderIce2/rpc-bridge) into the ReSkate folder and adds it to the launch option. It works with Discord and Vesktop (with arRPC turned on), and needs a folder path without spaces. With Flatpak Steam, also run `flatpak override --user --filesystem=xdg-run/discord-ipc-0 com.valvesoftware.Steam`.
 
