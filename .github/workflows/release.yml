@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-22.04 # older glibc = AppImage runs on more distros
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64 # build.rs: nativepicker.dll
       - run: cargo build --release
       - run: |
           mkdir -p AppDir/usr/bin
@@ -19,6 +20,7 @@ jobs:
           touch AppDir/reskate-installer.png # ponytail: empty icon, add real art later
           curl -Lo appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
-          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir reskate-installer-x86_64.AppImage
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run AppDir reskate-installer-$version-x86_64.AppImage
       - uses: actions/upload-artifact@v4
-        with: { name: reskate-installer-linux, path: reskate-installer-x86_64.AppImage }
+        with: { name: reskate-installer-linux, path: "reskate-installer-*-x86_64.AppImage" }

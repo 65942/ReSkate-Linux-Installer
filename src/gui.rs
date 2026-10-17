@@ -309,13 +309,16 @@ struct App {
     close_steam: Option<Vec<String>>,
     /// The version ReSkate is pinned to; None = the latest, updating itself.
     pinned: Option<String>,
-    /// Installable releases, newest first, fetched in the background.
-    releases: Arc<Mutex<Vec<String>>>,
+    /// Installable releases, newest first, and whether each is a pre-release; fetched in the background.
+    releases: Arc<Mutex<Vec<(String, bool)>>>,
     /// Version picked in the dropdown ("" = the latest).
     selected: String,
     /// Installed with Discord Rich Presence (rpc-bridge), and the checkbox for it.
     bridge: bool,
     rpc: bool,
+    /// Installed with the desktop's file picker for ReSkate (`--native-picker`), and the checkbox for it.
+    has_picker: bool,
+    picker: bool,
     /// Install/Repair fixes file names with `\` in them (`--fix-names`); `broken_names`: ReSkate's folder has some.
     fix_names: bool,
     broken_names: bool,
@@ -327,7 +330,7 @@ impl App {
             log: Default::default(), busy: Default::default(), ran: false, skate: Err(String::new()), placeholder: false, outdated: false, installed: None,
             launch_ok: false, dir_input: crate::default_dir().display().to_string(), picked_folder: Default::default(),
             show_log: false, confirm: false, delete_folder: false, close_steam: None,
-            pinned: None, releases: Default::default(), selected: String::new(), bridge: false, rpc: false, fix_names: true, broken_names: false,
+            pinned: None, releases: Default::default(), selected: String::new(), bridge: false, rpc: false, has_picker: false, picker: false, fix_names: true, broken_names: false,
         };
         app.refresh_status();
         app
@@ -343,6 +346,8 @@ impl App {
         self.selected = self.pinned.clone().unwrap_or_default();
         self.bridge = crate::rpc();
         self.rpc = self.bridge;
+        self.has_picker = crate::picker();
+        self.picker = self.has_picker;
         self.broken_names = self.installed.as_deref().is_some_and(crate::broken_names);
         if let Some(d) = &self.installed { self.dir_input = d.display().to_string(); }
     }
@@ -388,6 +393,7 @@ impl App {
         if self.installed.is_none() { args.push(self.dir_input.trim().to_owned()); }
         if !version.is_empty() { args.extend(["--version".to_owned(), version.to_owned()]); }
         if self.rpc { args.push("--rpc".to_owned()); }
+        if self.picker { args.push("--native-picker".to_owned()); }
         if self.fix_names { args.push("--fix-names".to_owned()); }
         self.steam_task(ctx, &args.iter().map(String::as_str).collect::<Vec<_>>());
     }
@@ -427,7 +433,7 @@ impl App {
                     Some(_) if broken => "Some files in ReSkate's folder have broken names, which break mods: press Repair".into(),
                     Some(d) => format!("Installed in {} · {}", d.display(),
                         self.pinned.as_ref().map_or("updates itself".to_owned(), |v| format!("pinned to {v}"))),
-                    None => "Offline play, multiplayer and mods for skate.".into(),
+                    None => "Offline play, multiplayer and mods for skate. You don't need skate. installed in Steam.".into(),
                 };
                 let bad = self.installed.is_some() && (!self.launch_ok || self.outdated || broken);
                 ui.label(RichText::new(sub).small().color(if bad { p.danger } else { p.muted }));
@@ -454,7 +460,7 @@ impl App {
                         let b = egui::Button::new(RichText::new("Uninstall").color(p.danger)).fill(p.danger.gamma_multiply(0.12)).min_size(size);
                         if ui.add(b).clicked() { self.delete_folder = false; self.confirm = true; }
                         let current = self.pinned.clone().unwrap_or_default();
-                        if self.selected != current || self.rpc != self.bridge {
+                        if self.selected != current || self.rpc != self.bridge || self.picker != self.has_picker {
                             let label = if self.selected != current { "Switch" } else { "Apply" };
                             if ui.add(primary(label).min_size(size)).clicked() { self.install(ui.ctx(), &self.selected.clone()); }
                         } else if !self.launch_ok || self.outdated || broken {
@@ -467,13 +473,20 @@ impl App {
                     }
                 }
                 let tags = self.releases.lock().unwrap().clone();
-                let latest = tags.first().map_or_else(|| "Latest".to_owned(), |t| format!("{t} (latest)"));
-                let shown = if self.selected.is_empty() { latest.clone() } else { self.selected.clone() };
+                // "Latest" is what a plain install gets: the newest release that isn't a pre-release.
+                let stable = tags.iter().find(|(_, pre)| !pre).map(|(t, _)| t.clone());
+                let latest = stable.as_ref().map_or_else(|| "Latest".to_owned(), |t| format!("{t} (latest)"));
+                let label = |t: &str, pre: bool| if pre { format!("{t} (pre-release)") } else { t.to_owned() };
+                let shown = if self.selected.is_empty() { latest.clone() } else {
+                    label(&self.selected, tags.iter().any(|(t, pre)| *pre && *t == self.selected))
+                };
                 ui.add_enabled_ui(!tags.is_empty(), |ui| {
-                    egui::ComboBox::from_id_salt("version").width(130.0).selected_text(shown).show_ui(ui, |ui| {
+                    egui::ComboBox::from_id_salt("version").width(160.0).selected_text(shown).show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.selected, String::new(), latest).on_hover_text("Updates itself");
-                        for t in tags.iter().skip(1) { ui.selectable_value(&mut self.selected, t.clone(), t); }
-                    }).response.on_hover_text("An older version is pinned: ReSkate won't update itself while it's picked.");
+                        for (t, pre) in tags.iter().filter(|(t, _)| Some(t) != stable.as_ref()) {
+                            ui.selectable_value(&mut self.selected, t.clone(), label(t, *pre));
+                        }
+                    }).response.on_hover_text("A version picked here is pinned: ReSkate won't update itself while it's picked.");
                 });
             });
         });
@@ -481,9 +494,12 @@ impl App {
         // Proton splits rpc-bridge's command on spaces.
         let spaces = self.dir_input.contains(char::is_whitespace);
         if spaces { self.rpc = false; }
-        ui.add_enabled(!spaces, egui::Checkbox::new(&mut self.rpc, "Discord Rich Presence"))
-            .on_hover_text("Installs rpc-bridge, so ReSkate can show what you're playing in Discord or Vesktop")
+        ui.add_enabled(!spaces, egui::Checkbox::new(&mut self.rpc, "Discord Rich Presence Fix"))
+            .on_hover_text("Installs rpc-bridge, so ReSkate can show what you're playing in Discord or Vesktop. Needs a Wine Staging based Proton such as GE-Proton")
             .on_disabled_hover_text("Needs a folder without spaces in its path");
+        ui.checkbox(&mut self.picker, "Desktop file picker (experimental)")
+            .on_hover_text("ReSkate's Install .zip, Install folder and profile buttons open your desktop's file picker \
+                instead of Wine's, and Open Mods folder opens your file manager. Changes skate.'s Wine prefix; Uninstall puts it back.");
         ui.checkbox(&mut self.fix_names, "Fix broken file names")
             .on_hover_text("On Install and Repair, fixes files whose names contain \\ (left by some Linux unzip tools). \
                 They stop ReSkate from combining mods, so only one custom map or cosmetic mod works.");
@@ -580,26 +596,22 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(egui::Frame::new().fill(p.bg).inner_margin(Margin::symmetric(24, 20))).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
             ui.heading(RichText::new("ReSkate Installer").strong().color(p.title));
-            section(ui, "skate.");
-            card(ui, |ui| match &self.skate {
-                Ok(Some(d)) if self.placeholder => {
-                    ui.label(RichText::new(format!("Placeholder in {}", d.display())).small().color(p.good));
-                    ui.label(RichText::new("ReSkate plays its own copy, so Steam only keeps EA's anti-cheat. \
-                        Don't use Verify integrity of game files on skate.: it downloads all 15 GB.").small().color(p.muted));
-                }
-                Ok(Some(d)) => { ui.label(RichText::new(format!("Found in {}", d.display())).small().color(p.good)); }
-                Ok(None) => {
-                    ui.label(RichText::new("Not installed in Steam. Install adds a placeholder instead: Steam needs one to start ReSkate, \
-                        and downloads only EA's anti-cheat for it (~350 MB) rather than the whole game (15 GB).").small().color(p.muted));
-                    if ui.button("Check again").clicked() { self.refresh_status(); }
-                }
-                Err(e) => {
-                    ui.label(RichText::new(e).small().color(p.danger));
-                    if ui.button("Check again").clicked() { self.refresh_status(); }
-                }
-            });
             section(ui, "ReSkate");
-            card(ui, |ui| self.reskate_card(ui, busy));
+            card(ui, |ui| {
+                // Steam or its config not found: Install stays disabled until this clears.
+                if let Err(e) = self.skate.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(e).small().color(p.danger));
+                        if ui.small_button("Check again").clicked() { self.refresh_status(); }
+                    });
+                    ui.separator();
+                }
+                self.reskate_card(ui, busy);
+            });
+            if self.placeholder {
+                ui.label(RichText::new("Don't use Verify integrity of game files on skate. in Steam: ReSkate plays its own copy, \
+                    and Verify downloads the whole game (15 GB).").small().color(p.muted));
+            }
             ui.label(RichText::new("Steam is closed while the launch option is changed (you're asked first) and started again after. \
                 Then press Play on skate. in Steam. ReSkate's launcher opens in place of EA's anti-cheat, which doesn't run under Proton, \
                 and installs its own copy of the game the first time. It keeps itself up to date.").small().color(p.muted));

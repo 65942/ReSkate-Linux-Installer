@@ -17,24 +17,39 @@ const BRIDGE_REPO: &str = "EnderIce2/rpc-bridge";
 /// rpc-bridge's folder inside ReSkate's, and its Steam script there.
 const BRIDGE_DIR: &str = "rpc-bridge";
 const BRIDGE_SH: &str = "rpc-bridge/bridge.sh";
+/// The desktop's file picker in place of Wine's (`--native-picker`): our DLL in skate.'s prefix asks this
+/// installer's `picker-helper`, copied next to it and wrapping the game in the launch option.
+const PICKER_DIR: &str = "native-picker";
+const PICKER_DLL: &str = "native-picker/nativepicker.dll";
+const PICKER_BIN: &str = "native-picker/reskate-installer";
+static NATIVE_PICKER_DLL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nativepicker.dll"));
+/// Where Wine's COM finds the Open dialog (only HKLM; it ignores HKCU's classes). 64-bit only, like ReSkate.
+const FILE_DIALOG_KEY: &str = r"[Software\\Classes\\CLSID\\{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}\\InprocServer32]";
+const WINE_DIALOG: &str = r"C:\windows\system32\comdlg32.dll";
+/// Opening a folder (ReSkate's "Open Mods folder") goes to Wine's own explorer without this; winebrowser hands it to
+/// the desktop's file manager through xdg-open. Wine's default prefix doesn't have the key.
+const FOLDER_OPEN_KEY: &str = r"[Software\\Classes\\folder\\shell\\open\\command]";
+const FOLDER_OPEN: &str = r#"@="C:\\windows\\system32\\winebrowser.exe \"%1\"""#;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |f: &str| args.iter().any(|a| a == f);
     let cmd = args.first().map(String::as_str);
     if cmd.is_none() { return gui::run().map_err(|e| anyhow::anyhow!("{e}")); }
+    // picker-helper <command...>: run from the launch option, everything after it is the game's.
+    if cmd == Some("picker-helper") { return picker_helper(&args[1..]); }
     // --close-steam: quit Steam for the edit (the GUI asks first) and start it again afterwards.
     let closed = flag("--close-steam") && steam_running() && { close_steam()?; true };
     let result = match cmd {
-        // install [<folder>] [--version <tag>] [--rpc] [--fix-names] [--close-steam]
+        // install [<folder>] [--version <tag>] [--rpc] [--native-picker] [--fix-names] [--close-steam]
         Some("install") => {
             let version = args.iter().position(|a| a == "--version").and_then(|i| args.get(i + 1)).map(String::as_str);
             let dir = args.iter().skip(1).find(|a| !a.starts_with("--") && Some(a.as_str()) != version).map(PathBuf::from);
-            install(dir, version, flag("--rpc"), flag("--fix-names"))
+            install(dir, version, flag("--rpc"), flag("--native-picker"), flag("--fix-names"))
         }
         // off [--delete] [--close-steam]
         Some("off") => uninstall(flag("--delete")),
-        _ => Err(anyhow::anyhow!("unknown command, use: install [<folder>] [--version <tag>] [--rpc] [--fix-names] | off [--delete], either with --close-steam")),
+        _ => Err(anyhow::anyhow!("unknown command, use: install [<folder>] [--version <tag>] [--rpc] [--native-picker] [--fix-names] | off [--delete], either with --close-steam")),
     };
     if closed {
         println!("starting Steam again");
@@ -45,8 +60,9 @@ fn main() -> Result<()> {
 
 /// Downloads a ReSkate release (the latest unless `version`) into `dir` and points skate.'s Steam launch option at
 /// its launcher. The launcher keeps itself up to date from then on, unless a version was picked: that one is pinned.
-/// `rpc` adds rpc-bridge to the launch option, for Discord Rich Presence. `fix_names` runs `fix_names` on the folder.
-fn install(dir: Option<PathBuf>, version: Option<&str>, rpc: bool, fix_names: bool) -> Result<()> {
+/// `rpc` adds rpc-bridge to the launch option, for Discord Rich Presence. `picker` sets up the desktop's file picker
+/// for ReSkate's Open dialogs. `fix_names` runs `fix_names` on the folder.
+fn install(dir: Option<PathBuf>, version: Option<&str>, rpc: bool, picker: bool, fix_names: bool) -> Result<()> {
     if let Some(v) = version && !supported(v) { bail!("{v} is too old: ReSkate installs into a folder of its own from {OLDEST} on"); }
     if steam_running() { bail!("Close Steam first, or pass --close-steam (Steam rewrites its settings when it closes)"); }
     // The Steam library to write skate.'s placeholder into: a new one, or the one there (to its current build).
@@ -91,6 +107,18 @@ fn install(dir: Option<PathBuf>, version: Option<&str>, rpc: bool, fix_names: bo
             println!("Flatpak Steam can't reach Discord on its own: run `flatpak override --user --filesystem=xdg-run/discord-ipc-0 com.valvesoftware.Steam` once");
         }
     } else if dir.join(BRIDGE_DIR).exists() { fs::remove_dir_all(dir.join(BRIDGE_DIR))?; }
+    if picker {
+        fs::create_dir_all(dir.join(PICKER_DIR))?;
+        fs::write(dir.join(PICKER_DLL), NATIVE_PICKER_DLL)?;
+        // A copy of this binary, so the launch option keeps working when the AppImage moves.
+        let (exe, bin) = (std::env::current_exe()?, dir.join(PICKER_BIN));
+        if exe != bin {
+            let tmp = bin.with_extension("new");
+            fs::copy(&exe, &tmp)?;
+            fs::rename(&tmp, &bin)?;
+        }
+        files.extend([PICKER_DLL, PICKER_BIN].map(str::to_owned));
+    } else if dir.join(PICKER_DIR).exists() { fs::remove_dir_all(dir.join(PICKER_DIR))?; }
     // Kept from before the first install, so uninstalling puts the user's own options back.
     let before = match &record {
         Some(r) => r.before.clone(),
@@ -98,7 +126,13 @@ fn install(dir: Option<PathBuf>, version: Option<&str>, rpc: bool, fix_names: bo
     };
     let pinned = version.map_or(String::new(), |_| tag.to_owned());
     if let Some(lib) = &placeholder_lib { write_placeholder(lib)?; }
-    set_launch_options(&launch_option(&dir, !pinned.is_empty(), rpc))?;
+    set_launch_options(&launch_option(&dir, !pinned.is_empty(), rpc, picker))?;
+    // Steam is closed, so skate.'s Wine isn't running and won't overwrite this. Without a prefix yet,
+    // picker-helper sets it on the first start.
+    if let Some(pfx) = skate_prefix().filter(|p| p.exists()) {
+        let dll = picker.then(|| dir.join(PICKER_DLL));
+        if let Err(e) = set_prefix_dialog(&pfx, dll.as_deref()) { eprintln!("couldn't set skate.'s file dialog: {e}"); }
+    }
     write_record(&Record { dir: dir.clone(), before, pinned: pinned.clone(), files })?;
     println!("ReSkate {tag} installed in {}", dir.display());
     if !pinned.is_empty() { println!("Pinned to {tag}: the launcher won't update itself. Install the latest version to follow updates again."); }
@@ -112,7 +146,10 @@ fn uninstall(delete: bool) -> Result<()> {
     if steam_running() { bail!("Close Steam first, or pass --close-steam (Steam rewrites its settings when it closes)"); }
     let r = read_record().context("ReSkate isn't installed")?;
     // Left alone if the user changed it since.
-    if launch_options()?.as_deref() == Some(&launch_option(&r.dir, !r.pinned.is_empty(), r.rpc())) { set_launch_options(&r.before)?; }
+    if launch_options()?.as_deref() == Some(&launch_option(&r.dir, !r.pinned.is_empty(), r.rpc(), r.picker())) { set_launch_options(&r.before)?; }
+    if r.picker() && let Some(pfx) = skate_prefix().filter(|p| p.exists()) {
+        if let Err(e) = set_prefix_dialog(&pfx, None) { eprintln!("couldn't put back Wine's file dialog: {e}"); }
+    }
     // Without ReSkate, Play would start EA's anti-cheat on a game that isn't there.
     if let Some(d) = placeholder() {
         fs::remove_file(d.parent().and_then(Path::parent).context("odd skate. folder")?.join(format!("appmanifest_{SKATE_APPID}.acf")))?;
@@ -187,11 +224,13 @@ pub fn broken_names(dir: &Path) -> bool { fix_names(dir, false).is_ok_and(|n| n 
 /// The Steam launch option that runs ReSkate's launcher in place of EA's anti-cheat (ReSkate's README,
 /// "Linux (Proton)"). Keeps skate.'s app ID and Proton prefix, unlike a non-Steam game shortcut. A pinned version
 /// gets the launcher's `--no-update`, or it would update itself to the latest on its first start. With `rpc`,
-/// rpc-bridge's script wraps it all and has Proton start the bridge next to the game.
-pub fn launch_option(dir: &Path, pinned: bool, rpc: bool) -> String {
+/// rpc-bridge's script wraps it all and has Proton start the bridge next to the game. With `picker`, picker-helper
+/// wraps the rest and answers the native picker DLL while the game runs.
+pub fn launch_option(dir: &Path, pinned: bool, rpc: bool, picker: bool) -> String {
     let no_update = if pinned { " --no-update" } else { "" };
     let bridge = if rpc { format!("sh \"{}\" ", dir.join(BRIDGE_SH).display()) } else { String::new() };
-    format!("{bridge}bash -c 'exec \"${{@/*{ANTICHEAT}/{}}}\"{no_update}' -- %command%", dir.join(LAUNCHER).display())
+    let helper = if picker { format!("\"{}\" picker-helper ", dir.join(PICKER_BIN).display()) } else { String::new() };
+    format!("{bridge}{helper}bash -c 'exec \"${{@/*{ANTICHEAT}/{}}}\"{no_update}' -- %command%", dir.join(LAUNCHER).display())
 }
 
 /// The first release whose launcher installs the game into an empty folder of its own (and has `--no-update`).
@@ -203,11 +242,12 @@ fn supported(tag: &str) -> bool {
     v(tag) >= v(OLDEST)
 }
 
-/// Releases this installer can install, newest first.
-pub fn releases() -> Result<Vec<String>> {
+/// Releases this installer can install, newest first, and whether each is a pre-release. A plain install follows
+/// GitHub's releases/latest, which skips those.
+pub fn releases() -> Result<Vec<(String, bool)>> {
     let list = github_json(&format!("{REPO}/releases?per_page=100"))?;
     Ok(list.as_array().into_iter().flatten().filter(|r| r["draft"] != true)
-        .filter_map(|r| r["tag_name"].as_str()).filter(|t| supported(t)).map(str::to_owned).collect())
+        .filter_map(|r| Some((r["tag_name"].as_str()?.to_owned(), r["prerelease"] == true))).filter(|(t, _)| supported(t)).collect())
 }
 
 /// A folder the launcher can run from, and that fits into the launch option as is.
@@ -242,6 +282,8 @@ struct Record { dir: PathBuf, before: String, pinned: String, files: Vec<String>
 impl Record {
     /// Installed with rpc-bridge.
     fn rpc(&self) -> bool { self.files.iter().any(|f| f == BRIDGE_SH) }
+    /// Installed with the native file picker.
+    fn picker(&self) -> bool { self.files.iter().any(|f| f == PICKER_BIN) }
 }
 
 fn read_record() -> Option<Record> {
@@ -263,12 +305,17 @@ pub fn installed() -> Option<PathBuf> {
 /// Whether skate.'s launch option still starts ReSkate (Steam or the user may have changed it).
 pub fn launch_ok() -> bool {
     let Some(r) = read_record().filter(|r| r.dir.join(LAUNCHER).exists()) else { return false };
-    launch_options().ok().flatten() == Some(launch_option(&r.dir, !r.pinned.is_empty(), r.rpc()))
+    launch_options().ok().flatten() == Some(launch_option(&r.dir, !r.pinned.is_empty(), r.rpc(), r.picker()))
 }
 
 /// Whether ReSkate was installed with Discord Rich Presence (rpc-bridge).
 pub fn rpc() -> bool {
     read_record().is_some_and(|r| r.rpc())
+}
+
+/// Whether ReSkate was installed with the native file picker.
+pub fn picker() -> bool {
+    read_record().is_some_and(|r| r.picker())
 }
 
 /// The version ReSkate is pinned to, if one was picked.
@@ -582,6 +629,108 @@ pub fn open_url(url: &str) {
     spawn_detached(c);
 }
 
+/// skate.'s Wine prefix: in the Steam library that has skate., as Steam makes it on the first start.
+fn skate_prefix() -> Option<PathBuf> {
+    let dir = skate_dir().ok()??;
+    Some(dir.parent()?.parent()?.join(format!("compatdata/{SKATE_APPID}/pfx")))
+}
+
+/// Points the prefix's Open dialog at our DLL (`dll`) and opens folders in the desktop's file manager, or puts back
+/// Wine's own for both. Rewrites system.reg only when that changes it; Wine must not be running in the prefix, or it
+/// overwrites the file when it exits.
+fn set_prefix_dialog(pfx: &Path, dll: Option<&Path>) -> Result<()> {
+    let path = pfx.join("system.reg");
+    let text = fs::read_to_string(&path)?;
+    // Wine sees the whole Linux filesystem as Z:.
+    let value = dll.map_or(WINE_DIALOG.to_owned(), |d| format!("Z:{}", d.display()).replace('/', "\\"));
+    let new = set_file_dialog(&text, &value).context("system.reg has no Open dialog class")?;
+    let new = set_folder_open(&new, dll.is_some());
+    if new != text { fs::write(&path, new)?; }
+    Ok(())
+}
+
+/// `text` (a Wine .reg file) with the folder open command removed, then added back at the end with `on`.
+fn set_folder_open(text: &str, on: bool) -> String {
+    let (mut out, mut skip, mut ours) = (String::with_capacity(text.len()), false, false);
+    for line in text.split_inclusive('\n') {
+        if line.starts_with('[') { skip = line.get(..FOLDER_OPEN_KEY.len()).is_some_and(|k| k.eq_ignore_ascii_case(FOLDER_OPEN_KEY)); }
+        if skip { ours |= line.trim_end() == FOLDER_OPEN; } else { out.push_str(line); }
+    }
+    // Already set: unchanged, so system.reg isn't rewritten on every start.
+    if on && ours { return text.to_owned(); }
+    if on {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        out.push_str(&format!("{FOLDER_OPEN_KEY} {now}\n{FOLDER_OPEN}\n\n"));
+    }
+    out
+}
+
+/// `text` (a Wine .reg file) with the Open dialog's InprocServer32 set to `dll`, or None without that key.
+fn set_file_dialog(text: &str, dll: &str) -> Option<String> {
+    let (mut out, mut in_key, mut done) = (String::with_capacity(text.len()), false, false);
+    for line in text.split_inclusive('\n') {
+        if line.starts_with('[') { in_key = line.get(..FILE_DIALOG_KEY.len()).is_some_and(|k| k.eq_ignore_ascii_case(FILE_DIALOG_KEY)); }
+        if in_key && !done && line.starts_with("@=") {
+            out.push_str(&format!("@=\"{}\"\n", dll.replace('\\', "\\\\")));
+            done = true;
+        } else { out.push_str(line); }
+    }
+    done.then_some(out)
+}
+
+/// Runs `cmd` (the rest of the launch option) and answers nativepicker.dll's requests until it exits. It runs
+/// before Steam's container, so the desktop's picker is reachable here, unlike from inside the game.
+fn picker_helper(cmd: &[String]) -> Result<()> {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+    let dir = std::env::current_exe()?.parent().context("no folder")?.to_owned();
+    // A Proton update can rewrite the prefix's registry; Wine isn't running yet, so put the entry back.
+    if let Some(data) = std::env::var_os("STEAM_COMPAT_DATA_PATH")
+        && let Err(e) = set_prefix_dialog(&Path::new(&data).join("pfx"), Some(&dir.join("nativepicker.dll"))) {
+        eprintln!("picker-helper: couldn't set skate.'s file dialog: {e}");
+    }
+    let mut child = Command::new(cmd.first().context("picker-helper: no command to run")?).args(&cmd[1..]).spawn()?;
+    // The DLL falls back to Wine's dialog once this goes stale (3 s).
+    let (alive, stop) = (dir.join("picker.alive"), Arc::new(AtomicBool::new(false)));
+    let beat = { let (alive, stop) = (alive.clone(), stop.clone()); std::thread::spawn(move || while !stop.load(Ordering::Relaxed) {
+        let _ = fs::File::options().create(true).write(true).open(&alive).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }) };
+    let status = loop {
+        if let Some(status) = child.try_wait()? { break status; }
+        let request = dir.join("picker.request");
+        if let Ok(text) = fs::read_to_string(&request) {
+            let _ = fs::remove_file(&request);
+            if let Some(answer) = picker_answer(&text) {
+                fs::write(dir.join("picker.response.tmp"), answer)?;
+                fs::rename(dir.join("picker.response.tmp"), dir.join("picker.response"))?;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    stop.store(true, Ordering::Relaxed);
+    let _ = beat.join();
+    let _ = fs::remove_file(&alive);
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Shows the desktop's picker for a request (id, "file"/"folder", title, filter name, filter like `*.zip;*.r2z`) and
+/// returns the response: id, then "ok" and the path, or "cancel".
+fn picker_answer(request: &str) -> Option<String> {
+    let mut lines = request.lines();
+    let (id, kind, title) = (lines.next()?, lines.next()?, lines.next()?);
+    let (filter_name, filter) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+    let mut dialog = rfd::FileDialog::new().set_title(title);
+    let picked = if kind == "folder" { dialog.pick_folder() } else {
+        let exts: Vec<&str> = filter.split(';').map(|p| p.trim().trim_start_matches("*.")).filter(|e| !e.is_empty() && *e != "*").collect();
+        if !exts.is_empty() { dialog = dialog.add_filter(filter_name, &exts); }
+        dialog.pick_file()
+    };
+    Some(match picked {
+        Some(p) => format!("{id}\nok\n{}\n", p.display()),
+        None => format!("{id}\ncancel\n"),
+    })
+}
+
 fn data_dir() -> Result<PathBuf> {
     Ok(dirs::data_dir().context("no data dir")?.join("reskate-installer"))
 }
@@ -607,7 +756,7 @@ fn github_asset(rel: &serde_json::Value, name: &str) -> Result<Vec<u8>> {
 fn launch_option_swaps_anticheat() {
     // Steam runs launch options through a shell with %command% replaced by the quoted command line.
     for (pinned, tail) in [(false, ""), (true, " --no-update")] {
-        let opt = launch_option(Path::new("/home/me/My Games/ReSkate"), pinned, false);
+        let opt = launch_option(Path::new("/home/me/My Games/ReSkate"), pinned, false, false);
         let cmd = opt.replace("%command%", "echo proton waitforexitandrun '/lib/common/skate./EAAntiCheat.GameServiceLauncher.exe'");
         let out = Command::new("sh").args(["-c", &cmd]).output().unwrap();
         assert_eq!(String::from_utf8_lossy(&out.stdout), format!("proton waitforexitandrun /home/me/My Games/ReSkate/ReSkateLauncher.exe{tail}\n"));
@@ -620,12 +769,51 @@ fn launch_option_runs_bridge() {
     let tmp = std::env::temp_dir().join(format!("reskate-installer-rpc-{}", std::process::id()));
     fs::create_dir_all(tmp.join(BRIDGE_DIR)).unwrap();
     fs::write(tmp.join(BRIDGE_SH), "BRIDGE_PATH=\"$(dirname \"$0\")/bridge.exe\" \"$@\"").unwrap();
-    let opt = launch_option(&tmp, true, true);
+    let opt = launch_option(&tmp, true, true, false);
     let cmd = opt.replace("%command%", "sh -c 'echo $BRIDGE_PATH \"$@\"' proton '/skate./EAAntiCheat.GameServiceLauncher.exe'");
     let out = Command::new("sh").args(["-c", &cmd]).output().unwrap();
     let (b, l) = (tmp.join(BRIDGE_DIR).join("bridge.exe"), tmp.join(LAUNCHER));
     assert_eq!(String::from_utf8_lossy(&out.stdout), format!("{} {} --no-update\n", b.display(), l.display()), "{out:?}");
     fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn launch_option_runs_picker_helper() {
+    // A stand-in helper that runs the rest like picker-helper does, after the bridge like with both on.
+    let tmp = std::env::temp_dir().join(format!("reskate installer-picker-{}", std::process::id()));
+    fs::create_dir_all(tmp.join(BRIDGE_DIR)).unwrap();
+    fs::create_dir_all(tmp.join(PICKER_DIR)).unwrap();
+    fs::write(tmp.join(BRIDGE_SH), "\"$@\"").unwrap();
+    fs::write(tmp.join(PICKER_BIN), "#!/bin/sh\n[ \"$1\" = picker-helper ] && shift && echo helper && exec \"$@\"").unwrap();
+    fs::set_permissions(tmp.join(PICKER_BIN), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let cmd = launch_option(&tmp, false, true, true).replace("%command%", "echo proton '/skate./EAAntiCheat.GameServiceLauncher.exe'");
+    let out = Command::new("sh").args(["-c", &cmd]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), format!("helper\nproton {}\n", tmp.join(LAUNCHER).display()), "{out:?}");
+    fs::remove_dir_all(&tmp).unwrap();
+}
+
+#[test]
+fn file_dialog_reg_edit() {
+    let reg = "[Software\\\\Classes\\\\CLSID\\\\{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}] 1791936545\n@=\"File Open Dialog\"\n\n\
+               [Software\\\\Classes\\\\CLSID\\\\{DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7}\\\\InprocServer32] 1791936545\n#time=1dd5b7039ae0ae0\n\
+               @=\"C:\\\\windows\\\\system32\\\\comdlg32.dll\"\n\"ThreadingModel\"=\"Apartment\"\n\n[Software\\\\Other] 1\n@=\"x\"\n";
+    let ours = set_file_dialog(reg, r"Z:\home\me\Games\ReSkate\native-picker\nativepicker.dll").unwrap();
+    assert_eq!(ours, reg.replace(r#"@="C:\\windows\\system32\\comdlg32.dll""#, r#"@="Z:\\home\\me\\Games\\ReSkate\\native-picker\\nativepicker.dll""#));
+    assert_eq!(set_file_dialog(&ours, WINE_DIALOG).unwrap(), reg);
+    assert_eq!(set_file_dialog("[Software\\\\Other] 1\n@=\"x\"\n", WINE_DIALOG), None);
+}
+
+#[test]
+fn folder_open_reg_edit() {
+    let reg = "[Software\\\\Classes\\\\file] 1\n@=\"FileMoniker\"\n\n[Software\\\\Classes\\\\folder\\\\shell\\\\open\\\\ddeexec] 1\n@=\"x\"\n\n";
+    let on = set_folder_open(reg, true);
+    assert!(on.starts_with(reg) && on.ends_with(&format!("{FOLDER_OPEN}\n\n")), "{on}");
+    assert_eq!(set_folder_open(&on, true), on);
+    assert_eq!(set_folder_open(&on, false), reg);
+    // Wine writes keys lowercase or not, and with its own #time line.
+    let wine = format!("{reg}[Software\\\\Classes\\\\Folder\\\\shell\\\\open\\\\command] 2\n#time=1d\n{FOLDER_OPEN}\n\n[Software\\\\Other] 1\n");
+    assert_eq!(set_folder_open(&wine, true), wine);
+    assert_eq!(set_folder_open(&wine, false), format!("{reg}[Software\\\\Other] 1\n"));
 }
 
 #[test]
